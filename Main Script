@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+import cv2
+import numpy as np
+import time
+from ultralytics import YOLO
+
+import Jetson.GPIO as GPIO
+
+# =========================================================
+# LIGHT (GPIO) CONFIG
+# =========================================================
+LIGHT_PIN = 12          # BOARD pin corresponding to register 0x02434088
+LIGHT_HOLD_S = 5.0      # keep light on for 5s after last detection
+
+def unlock_light_pin():
+    # Your pinmux unlock method for this pin
+    os.system("sudo busybox devmem 0x02434088 32 0x400")
+
+def init_light_gpio():
+    # Avoid "A different mode has already been set!"
+    GPIO.setwarnings(False)
+    try:
+        GPIO.cleanup()
+    except Exception:
+        pass
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setup(LIGHT_PIN, GPIO.OUT, initial=GPIO.LOW)
+
+def set_light(on: bool):
+    GPIO.output(LIGHT_PIN, GPIO.HIGH if on else GPIO.LOW)
+
+# =========================================================
+# PCA9685 HELPERS
+# =========================================================
+def us_to_ticks(pulse_us: float, freq_hz: float) -> int:
+    period_us = 1_000_000.0 / float(freq_hz)
+    ticks = int((float(pulse_us) / period_us) * 4096.0)
+    return max(0, min(4095, ticks))
+
+def set_pwm_us(pca, channel: int, pulse_us: float):
+    ticks = us_to_ticks(pulse_us, pca.frequency)
+    pca.channels[channel].duty_cycle = ticks << 4
+
+def set_servo_angle(pca, channel: int, angle: float,
+                    angle_max: float = 270.0,
+                    pulse_min_us: float = 500.0,
+                    pulse_max_us: float = 2500.0):
+    a = max(0.0, min(float(angle_max), float(angle)))
+    pulse = pulse_min_us + (a / float(angle_max)) * (pulse_max_us - pulse_min_us)
+    set_pwm_us(pca, channel, pulse)
+
+def init_pca9685(freq_hz=50):
+    import board
+    import busio
+    from adafruit_pca9685 import PCA9685
+    print("Initializing PCA9685...")
+    i2c = busio.I2C(board.SCL, board.SDA)
+    pca = PCA9685(i2c)
+    pca.frequency = freq_hz
+    return pca
+
+# =========================================================
+# CHANNELS
+# =========================================================
+PAN_CH  = 0
+TILT_CH = 1
+PAN_MIN,  PAN_MAX  = 0.0, 270.0
+TILT_MIN, TILT_MAX = 0.0, 270.0
+
+pan_angle  = (PAN_MIN + PAN_MAX) / 2
+tilt_angle = (TILT_MIN + TILT_MAX) / 2
+
+# --- TUNED FOR ZERO JITTER ---
+DEADZONE_PX = 80
+KP_PAN  = 15.0
+KP_TILT = 15.0
+MAX_STEP_PAN_DEG  = 1.0
+MAX_STEP_TILT_DEG = 1.0
+# -----------------------------
+
+PAN_SIGN  = -1.0
+TILT_SIGN = 1.0
+
+# =========================================================
+# LOAD YOLO MODEL + INIT HW
+# =========================================================
+print("Loading model...")
+model = YOLO("yolov8n.pt")
+model.to("cuda")
+
+pca = init_pca9685(freq_hz=50)
+set_servo_angle(pca, PAN_CH,  pan_angle)
+set_servo_angle(pca, TILT_CH, tilt_angle)
+
+# Light init
+unlock_light_pin()
+init_light_gpio()
+set_light(False)
+last_human_time = 0.0
+light_on = False
+
+gstreamer_pipeline = (
+    "nvarguscamerasrc ! "
+    "video/x-raw(memory:NVMM), width=(int)1280, height=(int)720, "
+    "format=(string)NV12, framerate=(fraction)30/1 ! "
+    "nvvidconv flip-method=0 ! "
+    "video/x-raw, format=(string)BGRx ! "
+    "videoconvert ! "
+    "video/x-raw, format=(string)BGR ! "
+    "appsink max-buffers=1 drop=true sync=false"
+)
+
+cap = cv2.VideoCapture(gstreamer_pipeline, cv2.CAP_GSTREAMER)
+
+# =========================================================
+# DYNAMIC DEADZONE STATE (CONTROL-ONLY ADDITION)
+# =========================================================
+# When target is still -> larger deadzone; when moving -> smaller deadzone
+MIN_DZ_PX = 20           # narrow deadzone when moving
+MAX_DZ_PX = 100          # wide deadzone when still (can be > DEADZONE_PX)
+SPEED_GAIN = 0.8         # px/frame -> deadzone shrink factor (tune)
+SPEED_ALPHA = 0.7        # smoothing (0.6-0.85 works well)
+
+prev_cx, prev_cy = None, None
+speed_filt = 0.0
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            break
+
+        now = time.time()
+
+        h, w = frame.shape[:2]
+        cx_img, cy_img = w // 2, h // 2
+
+        results = model(frame, classes=0, imgsz=320, verbose=False)
+
+        human_detected = len(results[0].boxes) > 0
+
+        # ========= LIGHT LOGIC (with hold) =========
+        if human_detected:
+            last_human_time = now
+
+        should_be_on = (now - last_human_time) < LIGHT_HOLD_S
+
+        if should_be_on != light_on:
+            light_on = should_be_on
+            set_light(light_on)
+            print("💡 LIGHT ON" if light_on else "⬇️ LIGHT OFF")
+        # ===========================================
+
+        if human_detected:
+            boxes = results[0].boxes.xyxy.detach().cpu().numpy()
+            areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            i = int(np.argmax(areas))
+            x1, y1, x2, y2 = boxes[i]
+
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+
+            diff_x = cx - cx_img
+            diff_y = cy - cy_img
+
+            # =========================================================
+            # CONTROL CODE (UPDATED): DYNAMIC DEADZONE + SAME KP/STEP
+            # =========================================================
+            if prev_cx is None:
+                prev_cx, prev_cy = cx, cy
+
+            # Pixel speed (px/frame)
+            dx = cx - prev_cx
+            dy = cy - prev_cy
+            speed = float((dx*dx + dy*dy) ** 0.5)
+
+            # Smooth it (prevents YOLO micro-jitter from collapsing your deadzone)
+            speed_filt = SPEED_ALPHA * speed_filt + (1.0 - SPEED_ALPHA) * speed
+
+            # Motion-adaptive deadzone
+            dyn_deadzone = MAX_DZ_PX - SPEED_GAIN * speed_filt
+            dyn_deadzone = max(MIN_DZ_PX, min(MAX_DZ_PX, dyn_deadzone))
+
+            # --- PAN (X axis) ---
+            if abs(diff_x) > dyn_deadzone:
+                err_x = diff_x / float(cx_img)
+                step = KP_PAN * err_x
+                if abs(step) > 0.5:
+                    step = max(-MAX_STEP_PAN_DEG, min(MAX_STEP_PAN_DEG, step))
+                    pan_angle += PAN_SIGN * step
+                    pan_angle = max(PAN_MIN, min(PAN_MAX, pan_angle))
+                    set_servo_angle(pca, PAN_CH, pan_angle)
+
+            # --- TILT (Y axis) ---
+            if abs(diff_y) > dyn_deadzone:
+                err_y = diff_y / float(cy_img)
+                step = KP_TILT * err_y
+                if abs(step) > 0.5:
+                    step = max(-MAX_STEP_TILT_DEG, min(MAX_STEP_TILT_DEG, step))
+                    tilt_angle += TILT_SIGN * step
+                    tilt_angle = max(TILT_MIN, min(TILT_MAX, tilt_angle))
+                    set_servo_angle(pca, TILT_CH, tilt_angle)
+
+            prev_cx, prev_cy = cx, cy
+            # =========================================================
+
+        cv2.imshow("CSI Human Tracking", results[0].plot())
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    # Safety: light off
+    try:
+        set_light(False)
+        GPIO.cleanup()
+    except Exception:
+        pass
+
+    cap.release()
+    cv2.destroyAllWindows()
+    pca.deinit()
+
