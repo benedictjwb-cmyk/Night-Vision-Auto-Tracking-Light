@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
 Single-file tracker + light + servos + MJPEG phone stream + realtime description overlay
-+ smoothness logging (angles, velocities, accelerations) to CSV.
++ adaptive deadzone based on target motion.
 
 Phone view:
   http://<JETSON_IP>:5000/
-
-Outputs:
-  zigzag_smoothness.csv  (t, pan/tilt deg, pan/tilt vel deg/s, pan/tilt acc deg/s^2, plus detection + cx/cy)
 """
 
 import os
@@ -16,10 +13,10 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import cv2
 import numpy as np
 import time
-import csv
 import textwrap
 import threading
 import time as _time
+import math
 
 from ultralytics import YOLO
 import Jetson.GPIO as GPIO
@@ -52,7 +49,7 @@ def _mjpeg_generator():
             continue
         yield (b"--frame\r\n"
                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-        _time.sleep(0.02)  # throttle a bit
+        _time.sleep(0.02)
 
 @app.route("/")
 def stream():
@@ -106,7 +103,7 @@ def describe_frame_yolo(results0, w, h, top_k=3):
     return f"I see {n} people: " + "; ".join(parts) + "."
 
 def overlay_description(frame_bgr, desc, w):
-    lines = textwrap.wrap(desc, width=60)[:2]  # 2 lines max
+    lines = textwrap.wrap(desc, width=60)[:2]
     pad = 8
     line_h = 26
     box_h = pad * 2 + line_h * len(lines)
@@ -184,22 +181,23 @@ TILT_MIN, TILT_MAX = 0.0, 270.0
 pan_angle  = (PAN_MIN + PAN_MAX) / 2
 tilt_angle = (TILT_MIN + TILT_MAX) / 2
 
-# Control params (keep as you like)
-DEADZONE_PX = 80
+# Proportional gains
 KP_PAN  = 15.0
 KP_TILT = 15.0
 
-# If you want less jerk, reduce these (e.g., 0.7)
-MAX_STEP_PAN_DEG  = 1.2
-MAX_STEP_TILT_DEG = 1.2
+# Motion-adaptive deadzone parameters
+DEADZONE_MIN_PX = 20.0
+DEADZONE_MAX_PX = 100.0
+ALPHA_MOTION = 0.7
+GV = 0.1 * DEADZONE_MAX_PX
+
+# Minimum and maximum angular command per update
+UMIN_DEG = 0.5
+MAX_STEP_PAN_DEG  = 1.0
+MAX_STEP_TILT_DEG = 1.0
 
 PAN_SIGN  = -1.0
 TILT_SIGN = 1.0
-
-# =========================================================
-# LOGGING (angles + velocities + accelerations)
-# =========================================================
-LOG_PATH = "zigzag_smoothness.csv"
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
@@ -233,31 +231,15 @@ gstreamer_pipeline = (
 
 cap = cv2.VideoCapture(gstreamer_pipeline, cv2.CAP_GSTREAMER)
 
-# Start stream server
 threading.Thread(target=start_stream_server, daemon=True).start()
 print("📡 Stream running. Open on phone: http://<JETSON_IP>:5000/")
 
-# Open CSV
-log_f = open(LOG_PATH, "w", newline="")
-log = csv.writer(log_f)
-log.writerow([
-    "t",
-    "pan_deg", "tilt_deg",
-    "pan_vel_deg_s", "tilt_vel_deg_s",
-    "pan_acc_deg_s2", "tilt_acc_deg_s2",
-    "human", "cx", "cy"
-])
+# Adaptive deadzone state
+prev_target_cx = None
+prev_target_cy = None
+motion_filt_px = 0.0
 
-t0 = time.time()
-prev_t = None
-
-# Derivative state
-prev_pan = None
-prev_tilt = None
-prev_pan_vel = 0.0
-prev_tilt_vel = 0.0
-
-# Simple FPS estimate for overlay/debug
+# Simple FPS estimate
 fps = 0.0
 last_fps_t = time.time()
 
@@ -271,15 +253,15 @@ try:
             break
 
         now = time.time()
-        t = now - t0
 
         h, w = frame.shape[:2]
         cx_img, cy_img = w // 2, h // 2
 
         results = model(frame, classes=0, imgsz=320, verbose=False)
-        human_detected = len(results[0].boxes) > 0
+        human_count = len(results[0].boxes)
+        human_detected = human_count > 0
 
-        # ========= LIGHT LOGIC (with hold) =========
+        # ========= LIGHT LOGIC =========
         if human_detected:
             last_human_time = now
 
@@ -289,9 +271,10 @@ try:
             light_on = should_be_on
             set_light(light_on)
             print("💡 LIGHT ON" if light_on else "⬇️ LIGHT OFF")
-        # ===========================================
 
+        # Defaults
         cx = cy = None
+        current_deadzone_px = DEADZONE_MAX_PX
 
         # ========= SERVO CONTROL =========
         if human_detected:
@@ -303,102 +286,89 @@ try:
             cx = int((x1 + x2) / 2)
             cy = int((y1 + y2) / 2)
 
-            diff_x = cx - cx_img
-            diff_y = cy - cy_img
+            # Motion estimate from target displacement between frames
+            if prev_target_cx is None or prev_target_cy is None:
+                target_motion_px = 0.0
+                motion_filt_px = 0.0
+            else:
+                dx_motion = float(cx - prev_target_cx)
+                dy_motion = float(cy - prev_target_cy)
+                target_motion_px = math.sqrt(dx_motion**2 + dy_motion**2)
+                motion_filt_px = (
+                    ALPHA_MOTION * motion_filt_px +
+                    (1.0 - ALPHA_MOTION) * target_motion_px
+                )
+
+            # Adaptive deadzone
+            current_deadzone_px = clamp(
+                DEADZONE_MAX_PX - GV * motion_filt_px,
+                DEADZONE_MIN_PX,
+                DEADZONE_MAX_PX
+            )
+
+            # Save target centre for next frame
+            prev_target_cx = cx
+            prev_target_cy = cy
+
+            # Tracking error relative to image centre
+            diff_x = float(cx - cx_img)
+            diff_y = float(cy - cy_img)
+
+            err_x = diff_x / float(cx_img)
+            err_y = diff_y / float(cy_img)
 
             # PAN
-            if abs(diff_x) > DEADZONE_PX:
-                err_x = diff_x / float(cx_img)
+            if abs(diff_x) > current_deadzone_px:
                 step = KP_PAN * err_x
-                if abs(step) > 0.5:
+                if abs(step) >= UMIN_DEG:
                     step = clamp(step, -MAX_STEP_PAN_DEG, MAX_STEP_PAN_DEG)
                     pan_angle += PAN_SIGN * step
                     pan_angle = clamp(pan_angle, PAN_MIN, PAN_MAX)
                     set_servo_angle(pca, PAN_CH, pan_angle)
 
             # TILT
-            if abs(diff_y) > DEADZONE_PX:
-                err_y = diff_y / float(cy_img)
+            if abs(diff_y) > current_deadzone_px:
                 step = KP_TILT * err_y
-                if abs(step) > 0.5:
+                if abs(step) >= UMIN_DEG:
                     step = clamp(step, -MAX_STEP_TILT_DEG, MAX_STEP_TILT_DEG)
                     tilt_angle += TILT_SIGN * step
                     tilt_angle = clamp(tilt_angle, TILT_MIN, TILT_MAX)
                     set_servo_angle(pca, TILT_CH, tilt_angle)
-        # ===========================================
 
-        # ========= DERIVATIVES (vel/acc) =========
-        pan_vel = tilt_vel = 0.0
-        pan_acc = tilt_acc = 0.0
-
-        if prev_t is not None:
-            dt = t - prev_t
-            if dt > 1e-6:
-                if prev_pan is None:
-                    prev_pan = pan_angle
-                    prev_tilt = tilt_angle
-
-                pan_vel = (pan_angle - prev_pan) / dt
-                tilt_vel = (tilt_angle - prev_tilt) / dt
-
-                pan_acc = (pan_vel - prev_pan_vel) / dt
-                tilt_acc = (tilt_vel - prev_tilt_vel) / dt
-
-                prev_pan_vel = pan_vel
-                prev_tilt_vel = tilt_vel
-
-                prev_pan = pan_angle
-                prev_tilt = tilt_angle
-
-        prev_t = t
-        # ===========================================
-
-        # ========= LOG ROW =========
-        log.writerow([
-            f"{t:.4f}",
-            f"{pan_angle:.3f}", f"{tilt_angle:.3f}",
-            f"{pan_vel:.3f}", f"{tilt_vel:.3f}",
-            f"{pan_acc:.3f}", f"{tilt_acc:.3f}",
-            1 if human_detected else 0,
-            "" if cx is None else cx,
-            "" if cy is None else cy,
-        ])
-
-        # Flush occasionally so you don't lose data if you Ctrl+C
-        if int(t * 10) % 10 == 0:  # ~once per second
-            log_f.flush()
+        else:
+            # Reset motion state so reacquisition does not create a false spike
+            prev_target_cx = None
+            prev_target_cy = None
+            motion_filt_px = 0.0
 
         # ========= ANNOTATE + DESCRIPTION + STREAM =========
         annotated = results[0].plot()
-
         desc = describe_frame_yolo(results[0], w, h)
         annotated = overlay_description(annotated, desc, w)
 
-        # Small stats overlay (optional but useful for the test)
         now_t = time.time()
         dt_fps = now_t - last_fps_t
         if dt_fps > 1e-6:
             fps = 0.9 * fps + 0.1 * (1.0 / dt_fps)
         last_fps_t = now_t
 
-        stats = f"Light:{'ON' if light_on else 'OFF'}  FPS:{fps:.1f}  Pan:{pan_angle:.1f}  Tilt:{tilt_angle:.1f}"
+        stats = (
+            f"Light:{'ON' if light_on else 'OFF'}  "
+            f"People:{human_count}  "
+            f"FPS:{fps:.1f}  "
+            f"Pan:{pan_angle:.1f}  Tilt:{tilt_angle:.1f}  "
+            f"DZ:{current_deadzone_px:.1f}px"
+        )
         cv2.putText(annotated, stats, (12, h - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
         _set_latest_frame(annotated, jpeg_quality=80)
 
-        # Local window (optional)
         cv2.imshow("CSI Human Tracking", annotated)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
 finally:
-    try:
-        log_f.close()
-        print(f"✅ Saved log to {LOG_PATH}")
-    except Exception:
-        pass
-
     try:
         set_light(False)
         GPIO.cleanup()
@@ -408,4 +378,3 @@ finally:
     cap.release()
     cv2.destroyAllWindows()
     pca.deinit()
-
