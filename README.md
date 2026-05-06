@@ -4,6 +4,10 @@ This repository contains the code and supporting files for my third-year individ
 
 The project investigates the feasibility of an autonomous perception-guided lighting system that detects and tracks a human target in real time and directs a motorised light source towards them under day and night conditions. The final prototype combined YOLOv8-based human detection on an NVIDIA Jetson Orin Nano, a Raspberry Pi Camera Module V2 NoIR, an infrared illuminator, a pan-tilt mechanism driven through a PCA9685 servo driver, and GPIO-controlled floodlight switching.
 
+These two videos demonstrate the light in action: 
+Camera POV Demo: https://youtu.be/fggf2fM4tx4
+Person Tracking Demo https://youtube.com/shorts/HBrcA1gscnE?feature=share
+
 ## Overview
 
 The system captures live image frames, performs person detection locally on the Jetson Orin Nano, selects a target, calculates image-space tracking error, and updates the pan-tilt mechanism so that the light remains directed towards the detected person.
