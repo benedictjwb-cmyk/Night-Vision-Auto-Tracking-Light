@@ -8,7 +8,7 @@ These two videos demonstrate the light in action:
 
 Camera POV Demo: https://youtu.be/fggf2fM4tx4
 
-Person Tracking Demo https://youtube.com/shorts/HBrcA1gscnE?feature=share
+Person Tracking Demo: https://youtube.com/shorts/HBrcA1gscnE?feature=share
 
 ## Overview
 
